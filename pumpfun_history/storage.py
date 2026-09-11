@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS pump_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id INTEGER PRIMARY KEY,
     signature TEXT NOT NULL UNIQUE,
     slot INTEGER NOT NULL,
     timestamp INTEGER NOT NULL,
@@ -33,9 +34,8 @@ CREATE TABLE IF NOT EXISTS pump_events (
     bonding_curve_progress REAL NOT NULL DEFAULT 0.0
 );
 
-CREATE INDEX IF NOT EXISTS idx_pump_events_mint ON pump_events(mint);
-CREATE INDEX IF NOT EXISTS idx_pump_events_timestamp ON pump_events(timestamp);
-CREATE INDEX IF NOT EXISTS idx_pump_events_signature ON pump_events(signature);
+CREATE INDEX IF NOT EXISTS idx_pump_events_mint_ts
+    ON pump_events(mint, timestamp, slot);
 
 CREATE TABLE IF NOT EXISTS crawl_state (
     mint TEXT PRIMARY KEY,
@@ -63,7 +63,7 @@ CREATE TABLE IF NOT EXISTS crawl_processed_txs (
     signature TEXT NOT NULL,
     slot INTEGER NOT NULL,
     PRIMARY KEY (mint, signature)
-);
+) WITHOUT ROWID;
 """
 
 
@@ -85,6 +85,7 @@ class Storage:
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("PRAGMA journal_mode=WAL")
             await db.execute("PRAGMA synchronous=NORMAL")
+            await db.execute("PRAGMA temp_store=MEMORY")
             await db.executescript(SCHEMA)
             await self._migrate_schema(db)
             await db.commit()
@@ -106,6 +107,16 @@ class Storage:
             await db.execute(
                 "ALTER TABLE crawl_state ADD COLUMN status TEXT NOT NULL DEFAULT 'in_progress'"
             )
+        # Prefer one composite mint index; drop older bulky single-column indexes.
+        await db.execute("DROP INDEX IF EXISTS idx_pump_events_mint")
+        await db.execute("DROP INDEX IF EXISTS idx_pump_events_timestamp")
+        await db.execute("DROP INDEX IF EXISTS idx_pump_events_signature")
+        await db.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_pump_events_mint_ts
+                ON pump_events(mint, timestamp, slot)
+            """
+        )
 
     async def get_crawl_state(self, mint: str) -> CrawlState | None:
         async with aiosqlite.connect(self.db_path, timeout=60) as db:
@@ -216,7 +227,10 @@ class Storage:
         export_json: bool = True,
     ) -> None:
         """Persist crawl state and optionally export JSON atomically."""
-        state.total_events = await self.count_events(state.mint)
+        db_count = await self.count_events(state.mint)
+        # After event purge, JSON is source of truth — don't zero total_events.
+        if db_count > 0:
+            state.total_events = db_count
         await self.upsert_crawl_state(state)
         if export_json:
             await self.export_mint_json(
@@ -227,6 +241,10 @@ class Storage:
                 status=state.status,
                 pagination_token=state.pagination_token,
                 credits_used=state.credits_used,
+            )
+            await self.release_mint_sqlite_payload(
+                state.mint,
+                completed=state.status == "complete" and state.sig_collection_complete,
             )
 
     async def signature_exists(self, signature: str) -> bool:
@@ -419,11 +437,14 @@ class Storage:
             )
             for event in events
         ]
+        prior_events = state.total_events
 
         async with self._write_lock:
             async with aiosqlite.connect(self.db_path, timeout=30) as db:
                 await db.execute("PRAGMA busy_timeout = 30000")
+                inserted_events = 0
                 if event_rows:
+                    before = db.total_changes
                     await db.executemany(
                         """
                         INSERT OR IGNORE INTO pump_events (
@@ -435,6 +456,7 @@ class Storage:
                         """,
                         event_rows,
                     )
+                    inserted_events = db.total_changes - before
                 if processed:
                     await db.executemany(
                         """
@@ -443,12 +465,8 @@ class Storage:
                         """,
                         [(state.mint, signature, slot) for signature, slot in processed],
                     )
-                async with db.execute(
-                    "SELECT COUNT(*) FROM pump_events WHERE mint = ?",
-                    (state.mint,),
-                ) as cursor:
-                    row = await cursor.fetchone()
-                    state.total_events = row[0] if row else 0
+                # JSON holds history; SQLite may only have the current page.
+                state.total_events = prior_events + max(0, inserted_events)
                 await db.execute(
                     """
                     INSERT INTO crawl_state (
@@ -543,40 +561,44 @@ class Storage:
         return count
 
     async def fetch_events(self, mint: str) -> list[dict[str, Any]]:
-        """Return all stored events for a mint ordered by timestamp."""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                """
-                SELECT signature, slot, timestamp, mint, side, wallet,
-                       sol_amount, token_amount, price,
-                       virtual_sol_reserve, virtual_token_reserve,
-                       bonding_curve_progress
-                FROM pump_events
-                WHERE mint = ?
-                ORDER BY timestamp ASC, slot ASC
-                """,
-                (mint,),
-            ) as cursor:
-                rows = await cursor.fetchall()
+        """Return full event history (JSON + current SQLite page buffer)."""
+        existing = await asyncio.to_thread(self._load_json_events, mint)
+        db_events = await self.fetch_events_from_db(mint)
+        if not existing:
+            return db_events
+        if not db_events:
+            return existing
 
-        return [
-            {
-                "signature": row["signature"],
-                "slot": row["slot"],
-                "timestamp": row["timestamp"],
-                "mint": row["mint"],
-                "side": row["side"],
-                "wallet": row["wallet"],
-                "sol_amount": row["sol_amount"],
-                "token_amount": row["token_amount"],
-                "price": row["price"],
-                "virtual_sol_reserve": row["virtual_sol_reserve"],
-                "virtual_token_reserve": row["virtual_token_reserve"],
-                "bonding_curve_progress": row["bonding_curve_progress"],
-            }
-            for row in rows
-        ]
+        merged: dict[str, dict[str, Any]] = {}
+        for event in existing:
+            signature = event.get("signature")
+            if signature:
+                merged[str(signature)] = event
+        for event in db_events:
+            signature = event.get("signature")
+            if signature:
+                merged[str(signature)] = event
+        return sorted(
+            merged.values(),
+            key=lambda item: (int(item.get("timestamp") or 0), int(item.get("slot") or 0)),
+        )
+
+    def _json_path_or_none(self, mint: str) -> Path | None:
+        try:
+            return self.json_path_for_mint(mint)
+        except ValueError:
+            return None
+
+    def _load_json_events(self, mint: str) -> list[dict[str, Any]]:
+        path = self._json_path_or_none(mint)
+        if path is None or not path.is_file():
+            return []
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        events = data.get("events") or []
+        return events if isinstance(events, list) else []
 
     def json_path_for_mint(self, mint: str, wallet: str | None = None) -> Path:
         owner = wallet or self.export_wallet
@@ -596,11 +618,32 @@ class Storage:
         pagination_token: str | None = None,
         credits_used: int | None = None,
     ) -> Path:
-        """Write bonding-curve events to data/<wallet>/<mint>.json."""
-        events = await self.fetch_events(mint)
-        events, curve_meta = trim_events_to_bonding_curve(events)
+        """Write bonding-curve events to data/<wallet>/<mint>.json.
+
+        Merges any existing JSON history with the current SQLite page buffer so
+        SQLite can stay small (page-sized) while JSON remains the durable store.
+        """
         path = self.json_path_for_mint(mint, wallet=wallet)
         path.parent.mkdir(parents=True, exist_ok=True)
+
+        existing = await asyncio.to_thread(self._load_json_events, mint)
+        db_events = await self.fetch_events_from_db(mint)
+
+        merged: dict[str, dict[str, Any]] = {}
+        for event in existing:
+            signature = event.get("signature")
+            if signature:
+                merged[str(signature)] = event
+        for event in db_events:
+            signature = event.get("signature")
+            if signature:
+                merged[str(signature)] = event
+
+        events = sorted(
+            merged.values(),
+            key=lambda item: (int(item.get("timestamp") or 0), int(item.get("slot") or 0)),
+        )
+        events, curve_meta = trim_events_to_bonding_curve(events)
 
         payload = {
             "mint": mint,
@@ -635,3 +678,73 @@ class Storage:
 
         logger.debug("Exported %d events to %s", len(events), path)
         return path
+
+    async def fetch_events_from_db(self, mint: str) -> list[dict[str, Any]]:
+        """SQLite-only event rows (no JSON fallback)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """
+                SELECT signature, slot, timestamp, mint, side, wallet,
+                       sol_amount, token_amount, price,
+                       virtual_sol_reserve, virtual_token_reserve,
+                       bonding_curve_progress
+                FROM pump_events
+                WHERE mint = ?
+                ORDER BY timestamp ASC, slot ASC
+                """,
+                (mint,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+
+        return [
+            {
+                "signature": row["signature"],
+                "slot": row["slot"],
+                "timestamp": row["timestamp"],
+                "mint": row["mint"],
+                "side": row["side"],
+                "wallet": row["wallet"],
+                "sol_amount": row["sol_amount"],
+                "token_amount": row["token_amount"],
+                "price": row["price"],
+                "virtual_sol_reserve": row["virtual_sol_reserve"],
+                "virtual_token_reserve": row["virtual_token_reserve"],
+                "bonding_curve_progress": row["bonding_curve_progress"],
+            }
+            for row in rows
+        ]
+
+    async def release_mint_sqlite_payload(
+        self,
+        mint: str,
+        *,
+        completed: bool = False,
+    ) -> None:
+        """Drop bulky per-mint rows after JSON export. Keeps crawl_state for resume."""
+        async with self._write_lock:
+            async with aiosqlite.connect(self.db_path, timeout=30) as db:
+                await db.execute("PRAGMA busy_timeout = 30000")
+                await db.execute("DELETE FROM pump_events WHERE mint = ?", (mint,))
+                if completed:
+                    await db.execute(
+                        "DELETE FROM crawl_processed_txs WHERE mint = ?",
+                        (mint,),
+                    )
+                    await db.execute(
+                        "DELETE FROM pending_signatures WHERE mint = ?",
+                        (mint,),
+                    )
+                await db.commit()
+                await db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    async def compact_database(self) -> None:
+        """Reclaim disk space after purging completed mint payloads."""
+        if not self.db_path.is_file():
+            return
+        async with self._write_lock:
+            async with aiosqlite.connect(self.db_path, timeout=60) as db:
+                await db.execute("PRAGMA busy_timeout = 60000")
+                await db.execute("VACUUM")
+                await db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            logger.debug("Compacted database: %s", self.db_path)

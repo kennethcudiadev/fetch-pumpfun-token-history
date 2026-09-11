@@ -42,3 +42,20 @@ def get_log_level(cfg: dict[str, Any] | None = None) -> str:
 def get_viewer_port(cfg: dict[str, Any] | None = None) -> int:
     cfg = cfg if cfg is not None else load_project_config()
     return max(1, int(cfg.get("viewer_port") or 8080))
+
+
+def get_max_events_per_mint(cfg: dict[str, Any] | None = None) -> int | None:
+    """Max TradeEvents to keep per mint (oldest-first). None / <=0 = unlimited."""
+    cfg = cfg if cfg is not None else load_project_config()
+    raw = cfg.get("max_events_per_mint")
+    if raw is None or raw == "":
+        return None
+    limit = int(raw)
+    return limit if limit > 0 else None
+
+
+def get_scan_parallel(cfg: dict[str, Any] | None = None) -> int:
+    """How many time-window shards to scan concurrently (1 = sequential)."""
+    cfg = cfg if cfg is not None else load_project_config()
+    raw = cfg.get("scan_parallel", 8)
+    return max(1, int(raw))

@@ -57,17 +57,25 @@ BATCH_PROGRESS_PATH = STATE_DIR / "batch_progress.json"
 DEFAULT_TRADER_LOOKBACK_HOURS = 24
 TRADER_TX_BATCH_SIZE = 50
 
+# Mint crawl cap — oldest-first (sort_order=asc). None = unlimited.
+MAX_EVENTS_PER_MINT: int | None = None
+
+# Wallet scan: split time range into this many parallel shards.
+SCAN_PARALLEL = 8
+
 # Logging defaults — overridden by config.json log_level when present.
 LOG_LEVEL = "INFO"
 
 
 def _apply_project_config() -> None:
-    global HELIUS_KEYS, LOG_LEVEL, DEFAULT_TRADER_LOOKBACK_HOURS
+    global HELIUS_KEYS, LOG_LEVEL, DEFAULT_TRADER_LOOKBACK_HOURS, MAX_EVENTS_PER_MINT, SCAN_PARALLEL
     try:
         from project_config import (
             get_helius_keys,
             get_log_level,
             get_lookback_hours,
+            get_max_events_per_mint,
+            get_scan_parallel,
             load_project_config,
         )
     except ImportError:
@@ -79,6 +87,8 @@ def _apply_project_config() -> None:
         HELIUS_KEYS = keys
     LOG_LEVEL = get_log_level(cfg)
     DEFAULT_TRADER_LOOKBACK_HOURS = get_lookback_hours(cfg)
+    MAX_EVENTS_PER_MINT = get_max_events_per_mint(cfg)
+    SCAN_PARALLEL = get_scan_parallel(cfg)
 
 
 _apply_project_config()

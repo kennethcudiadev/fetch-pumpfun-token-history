@@ -6,6 +6,8 @@ from trader_mints import (
     aggregate_wallet_trades,
     build_trader_result,
     filter_signatures_for_window,
+    split_time_range,
+    uncovered_scan_windows,
     wallet_pump_trades,
 )
 
@@ -45,6 +47,30 @@ def test_aggregate_wallet_trades():
     assert stats["MintA"].first_trade_time == 100
     assert stats["MintA"].last_trade_time == 200
     assert stats["MintB"].buy_count == 1
+
+
+def test_uncovered_scan_windows_older_and_newer():
+    windows = uncovered_scan_windows(
+        covered_from=1_000_360,
+        covered_to=1_000_720,
+        desired_from=1_000_000,
+        desired_to=1_000_800,
+    )
+    assert windows == [
+        (1_000_000, 1_000_359, "extend_older"),
+        (1_000_721, 1_000_800, "extend_newer"),
+    ]
+
+
+def test_uncovered_scan_windows_already_covered():
+    assert uncovered_scan_windows(100, 200, 120, 180) == []
+
+
+def test_split_time_range_parallel_shards():
+    windows = split_time_range(1000, 1999, 4)
+    assert windows == [(1000, 1249), (1250, 1499), (1500, 1749), (1750, 1999)]
+    assert split_time_range(10, 12, 8) == [(10, 10), (11, 11), (12, 12)]
+    assert split_time_range(50, 40, 3) == []
 
 
 def test_build_trader_result():

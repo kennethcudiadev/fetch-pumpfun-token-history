@@ -17,6 +17,7 @@ from config import (
     HELIUS_KEYS,
     MAX_CONCURRENT_MINT_FETCHES,
     MAX_CONCURRENT_TX_FETCHES,
+    MAX_EVENTS_PER_MINT,
     SIGNATURES_PAGE_LIMIT,
     TX_BATCH_SIZE,
 )
@@ -56,6 +57,27 @@ async def crawl_mint_bulk(
     page_num = 0
     txs_seen = await storage.count_processed_txs(mint)
     state.total_signatures = txs_seen
+    max_events = MAX_EVENTS_PER_MINT
+    events_so_far = state.total_events
+
+    if max_events is not None and events_so_far >= max_events:
+        state.status = "complete"
+        state.sig_collection_complete = True
+        state.pagination_token = None
+        await storage.commit_crawl_page(state, [], [])
+        await storage.export_mint_json(
+            mint,
+            bonding_curve,
+            signatures_total=state.total_signatures,
+            status=state.status,
+            pagination_token=state.pagination_token,
+            credits_used=state.credits_used,
+        )
+        await storage.release_mint_sqlite_payload(mint, completed=True)
+        log_progress(
+            f"{_short(mint)}  event limit reached ({events_so_far}/{max_events}) — stopping crawl"
+        )
+        return state
 
     async for records, next_token, page_credits in client.iter_transaction_pages(
         bonding_curve,
@@ -75,8 +97,13 @@ async def crawl_mint_bulk(
         new_events: list[TradeEvent] = []
         processed: list[tuple[str, int]] = []
         curve_completed = False
+        event_limit_hit = False
 
         for record in records:
+            if max_events is not None and events_so_far >= max_events:
+                event_limit_hit = True
+                break
+
             signature = extract_transaction_signature(record)
             if not signature or signature in already_done:
                 continue
@@ -90,7 +117,16 @@ async def crawl_mint_bulk(
                     expected_mint=mint,
                 )
                 if events:
+                    if max_events is not None:
+                        remaining = max_events - events_so_far
+                        if remaining <= 0:
+                            event_limit_hit = True
+                            break
+                        if len(events) > remaining:
+                            events = events[:remaining]
+                            event_limit_hit = True
                     new_events.extend(events)
+                    events_so_far += len(events)
                     if _trade_events_complete_curve(events):
                         curve_completed = True
 
@@ -99,11 +135,11 @@ async def crawl_mint_bulk(
             state.last_processed_slot = slot
             txs_seen += 1
 
-            if curve_completed:
+            if curve_completed or event_limit_hit:
                 break
 
         state.total_signatures = txs_seen
-        if curve_completed or next_token is None:
+        if curve_completed or event_limit_hit or next_token is None:
             state.status = "complete"
             state.sig_collection_complete = True
             state.pagination_token = None
@@ -113,6 +149,7 @@ async def crawl_mint_bulk(
             state.pagination_token = next_token
 
         await storage.commit_crawl_page(state, new_events, processed)
+        events_so_far = state.total_events
         await storage.export_mint_json(
             mint,
             bonding_curve,
@@ -121,10 +158,20 @@ async def crawl_mint_bulk(
             pagination_token=state.pagination_token,
             credits_used=state.credits_used,
         )
+        await storage.release_mint_sqlite_payload(
+            mint,
+            completed=state.status == "complete",
+        )
         log_progress(
             f"{_short(mint)}  page {page_num}  txs={len(records)}  "
             f"done={txs_seen}  events={state.total_events}  credits={state.credits_used}"
         )
+        if event_limit_hit:
+            log_progress(
+                f"{_short(mint)}  event limit reached "
+                f"({state.total_events}/{max_events}) — stopping crawl"
+            )
+            return state
         if curve_completed:
             log_progress(f"{_short(mint)}  bonding curve complete — stopping crawl")
             return state
@@ -262,6 +309,7 @@ async def run_crawler(
             pagination_token=None,
             credits_used=state.credits_used,
         )
+        await storage.release_mint_sqlite_payload(mint, completed=True)
         events = await storage.fetch_events(mint) if load_events else []
         return events, path
     else:
@@ -320,6 +368,10 @@ async def run_crawler(
         status=state.status,
         pagination_token=state.pagination_token,
         credits_used=state.credits_used,
+    )
+    await storage.release_mint_sqlite_payload(
+        mint,
+        completed=state.status == "complete",
     )
 
     event_count = state.total_events
@@ -468,6 +520,7 @@ async def run_crawler_batch(mints: list[str], wallet: str, manifest_file: str) -
         await _save_progress("interrupted")
     elif len(completed_mints) >= total:
         await _save_progress("complete")
+    await storage.compact_database()
     return results
 
 
