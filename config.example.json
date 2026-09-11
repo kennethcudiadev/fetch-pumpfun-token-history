@@ -1,0 +1,11 @@
+{
+  "target_wallet": "YOUR_WALLET_ADDRESS",
+  "lookback_hours": 168,
+  "viewer_port": 8080,
+  "log_level": "INFO",
+  "helius_keys": [
+    "your-helius-key-1",
+    "your-helius-key-2"
+  ],
+  "tracked_traders": []
+}

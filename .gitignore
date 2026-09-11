@@ -1,0 +1,68 @@
+# === Keep this repo = fetch-only (scan / fetch / pumpfun_history) ===
+
+# Local bot / research / backtest stacks (not part of the fetcher)
+theo_bot/
+backtest_engine/
+backtest_viewer/
+research/
+viewer/
+.cursor/
+
+# Runtime data & logs
+data/
+logs/
+*.log
+*.jsonl
+
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+config.json
+
+# SQLite / crawl state
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+pump_events.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.swp
+*~
+
+# Local scratch / interrupted runs
+*.pem
+*.key
+intterupted token.txt
+*_backup.json
+*.tmp
+*.temp
+
+# Node (if any stray tooling)
+node_modules/

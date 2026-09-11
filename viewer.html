@@ -1,0 +1,625 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>KAMA Hysteresis Candle Monitor</title>
+<script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#0b0d10;color:#ddd;font-family:monospace;padding:12px}
+.top{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+select{background:#111;color:white;padding:7px;border:1px solid #30363d;border-radius:4px}
+.status{color:#00ff88}
+#cards{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+.card{background:#151a20;border:1px solid #30363d;border-radius:6px;padding:6px 14px;font-size:13px;white-space:nowrap}
+.card b{color:#eee}
+.trend-green{color:#00ff88;font-weight:bold}
+.trend-red{color:#ff4560;font-weight:bold}
+.chart-wrap{position:relative;height:560px;margin-top:10px;border:1px solid #30363d}
+#chart,#bg{position:absolute;top:0;left:0;width:100%;height:100%}
+#bg{pointer-events:none;z-index:0}
+#chart{z-index:1}
+.legend{display:flex;gap:14px;margin-top:6px;font-size:12px;color:#888}
+.legend span{display:inline-flex;align-items:center;gap:5px}
+.swatch{width:10px;height:10px;display:inline-block;border-radius:2px}
+.gmgn-link{position:absolute;left:8px;bottom:8px;z-index:2;background:rgba(11,13,16,0.75);color:#a78bfa;border:1px solid rgba(167,139,250,0.4);border-radius:4px;padding:3px 9px;font-size:11px;font-family:monospace;text-decoration:none}
+.gmgn-link:hover{background:rgba(167,139,250,0.15)}
+#tableWrap{margin-top:8px;max-height:150px;overflow-y:auto;border:1px solid #30363d;border-radius:6px}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th,td{padding:4px 8px;text-align:right;border-bottom:1px solid #20252d;white-space:nowrap}
+th:first-child,td:first-child{text-align:left}
+th{position:sticky;top:0;background:#151a20;color:#888;font-weight:normal}
+.pnl-pos{color:#00d084}
+.pnl-neg{color:#ff4560}
+.open-row{color:#f0b90b}
+</style>
+</head>
+<body>
+
+<div class="top">
+<select id="mint"></select>
+<select id="candleType">
+<option value="ohlcv">OHLCV (raw)</option>
+<option value="heikin_ashi">Heikin Ashi</option>
+<option value="kama_hysteresis">KAMA + Hysteresis</option>
+</select>
+<select id="priceMode">
+<option value="sol">Price (SOL)</option>
+<option value="mc" selected>MC (K USD)</option>
+</select>
+<span id="status" class="status">loading...</span>
+</div>
+
+<div id="cards"></div>
+
+<div class="chart-wrap">
+<canvas id="bg"></canvas>
+<div id="chart"></div>
+<a id="gmgnLink" class="gmgn-link" href="#" target="_blank" rel="noopener noreferrer">GMGN ↗</a>
+</div>
+
+<div class="legend">
+<span><i class="swatch" style="background:rgba(0,255,136,0.35)"></i>KAMA bullish</span>
+<span><i class="swatch" style="background:rgba(255,68,102,0.35)"></i>KAMA bearish</span>
+<span><i class="swatch" style="background:#3b82f6"></i>BUY</span>
+<span><i class="swatch" style="background:#f0b90b"></i>SELL</span>
+<span><i class="swatch" style="background:#ff8c00"></i>DOWNTREND start</span>
+<span><i class="swatch" style="background:#22d3ee"></i>DOWNTREND clear</span>
+</div>
+
+<div id="tableWrap">
+<table>
+<thead><tr><th>Trade</th><th>Entry</th><th>Exit</th><th>Size (SOL)</th><th>PnL %</th></tr></thead>
+<tbody id="tradeRows"></tbody>
+</table>
+</div>
+
+<script>
+
+const INDEX_URL="./index.json";
+const DIR=".";
+const POLL=3000;
+
+const GREEN="#00d084", RED="#ff4560", BLUE="#3b82f6", YELLOW="#f0b90b";
+const ORANGE="#ff8c00", CYAN="#22d3ee";
+// Green bullish bands render at two opacities within the same hue, keyed off a
+// per-green-run "triggered" STATE (see kamaTriggered below), not a raw per-candle
+// gate_pass re-check — the latter flickers during a hold whenever gate_pass wobbles
+// on candles that have no bearing on an already-open position. Dark = this run hasn't
+// yet seen a gate_pass==true candle; light = it has (and stays lit for the rest of the
+// run regardless of what gate_pass does afterward). Values tuned so all three layers
+// (dark bg < light bg < candle body) stay visually distinct — the candle series itself
+// uses solid GREEN above. Red (bearish) is unaffected — the gate never applies to sells.
+const BG_GREEN_DIM="rgba(0,255,136,0.07)", BG_GREEN_FULL="rgba(0,255,136,0.22)";
+const BG_RED="rgba(255,68,102,0.12)";
+// Default initial zoom on load/mint-switch: most recent N candles, not the whole
+// history (see the comment where this is used, in render()).
+const INITIAL_VISIBLE_CANDLES=150;
+
+let mint;
+let candleType="ohlcv"; // 'ohlcv' | 'heikin_ashi' | 'kama_hysteresis'
+let priceMode="mc";     // 'sol' | 'mc'
+let chart, series, markersApi=null;
+let loaded=false;
+let lastData=null;
+// Constant SOL->K-USD reference factor for the whole chart (see render()).
+// Switching Price/MC never re-plots data or touches zoom/scroll — it only
+// swaps how axis/crosshair labels are formatted, using this one factor, so
+// toggling never causes the visible chart to jump or rescale.
+let mcFactor=null;
+let barTimes=[];      // logical-index-aligned candle times, parallel to kamaColors
+let kamaColors=[];    // 'green' | 'red' per candle, same order as barTimes
+// Per-candle gate.gate_pass, same order as kamaColors. Logs recorded before the
+// confirmation gate existed have no `gate` field at all — those fall back to `true`,
+// which (via kamaTriggered below) makes the very first candle of every green run
+// already "triggered", i.e. today's single-opacity behavior, unchanged for old logs.
+let kamaGatePass=[];
+// Per-candle "has this green run seen a gate_pass==true candle yet" STATE — computed
+// once per render() by scanning left to right (see there), not re-derived from raw
+// gate_pass per candle. This is what drawBackground actually paints from; it's what
+// keeps an already-triggered run lit through later gate_pass wobbles instead of
+// flickering while a position is held.
+let kamaTriggered=[];
+
+const chartEl=document.getElementById("chart");
+const wrapEl=document.querySelector(".chart-wrap");
+const bgCanvas=document.getElementById("bg");
+const bgCtx=bgCanvas.getContext("2d");
+
+function slotTime(x){
+ return Number(x)+1700000000;
+}
+
+// Meme-coin prices are frequently sub-1e-6. Show enough decimals to keep
+// several significant digits instead of collapsing to "0.00" or flipping
+// to exponential notation, which GMGN/Dexscreener-style charts avoid.
+function decimalsFor(absValue){
+ if(!isFinite(absValue)||absValue<=0) return 8;
+ if(absValue>=1) return 4;
+ const exp=Math.floor(Math.log10(absValue));
+ return Math.min(20,Math.max(4,-exp+3));
+}
+
+function fmt(x){
+ x=Number(x);
+ if(!isFinite(x)) return "0";
+ if(x===0) return "0";
+ const out=x.toFixed(decimalsFor(Math.abs(x)));
+ // Auto-generated axis gridlines can land on a tiny float epsilon (e.g.
+ // -1e-19) rather than exactly 0; collapse anything that rounds to all
+ // zeros instead of printing a long string of zeros with a stray "-".
+ return /^-?0\.?0*$/.test(out) ? "0" : out;
+}
+
+// Takes a value already converted to thousands of USD and adds the K/M/B
+// suffix a human expects for a market cap, GMGN-style ("3.53K" not "3530").
+function fmtMc(kUsd){
+ kUsd=Number(kUsd);
+ if(!isFinite(kUsd)) return "0";
+ const abs=Math.abs(kUsd);
+ if(abs>=1e6) return (kUsd/1e6).toFixed(2)+"B";
+ if(abs>=1e3) return (kUsd/1e3).toFixed(2)+"M";
+ return kUsd.toFixed(2)+"K";
+}
+
+// Single formatter handed to the chart at creation time; dispatches on the
+// current mode so toggling Price/MC doesn't require recreating the chart or
+// re-plotting data — the plotted values never change, only how this function
+// labels them. In MC mode every value (axis ticks, crosshair, last-price
+// label) is multiplied by the same constant mcFactor before formatting, so
+// the chart's shape/zoom stays pixel-identical across the toggle; only the
+// text changes. If this mint never got market-cap data at all, mcFactor is
+// null and MC mode falls back to the SOL formatter rather than showing
+// meaningless numbers.
+function activeFormatter(x){
+ if(priceMode==="mc"&&mcFactor!=null) return fmtMc(x*mcFactor);
+ return fmt(x);
+}
+
+// Finds the SOL->K-USD reference factor used by activeFormatter in MC mode:
+// (market_cap_usd/1000)/ohlcv.close from the most recent candle that has
+// market cap data. A single constant factor (not a per-candle one) is what
+// keeps the chart's shape identical when toggling Price/MC — see
+// activeFormatter's comment. Returns null if this mint has no market cap
+// data at all.
+function findMcFactor(candles){
+ for(let i=candles.length-1;i>=0;i--){
+  const c=candles[i];
+  if(c.market_cap_usd!=null&&c.ohlcv.close){
+   return (c.market_cap_usd/1000)/c.ohlcv.close;
+  }
+ }
+ return null;
+}
+
+// Builds the main series' candles from whichever source is selected. OHLCV
+// keeps the series' own bullish/bearish (close-vs-open) coloring, matching
+// normal GMGN-style candles. Heikin Ashi and KAMA+Hysteresis carry their own
+// backend-computed `.color` (HA smoothing / hysteresis-confirmed swing color,
+// which can disagree with a naive close-vs-open check), so those two are
+// colored explicitly per bar instead of left to the series default. Values
+// are always plotted in their native (SOL) unit regardless of priceMode —
+// MC mode only changes label formatting, never the plotted data.
+function candlesFor(data,type){
+ const bars=(data.candles||[]).map(c=>{
+  const src=c[type]||c.ohlcv;
+  const bar={
+   time:slotTime(c.slot),
+   open:Number(src.open),
+   high:Number(src.high),
+   low:Number(src.low),
+   close:Number(src.close)
+  };
+  if(type!=="ohlcv"&&src.color){
+   const bullish=String(src.color).toLowerCase()==="green";
+   const col=bullish?GREEN:RED;
+   bar.color=col;
+   bar.borderColor=col;
+   bar.wickColor=col;
+  }
+  return bar;
+ });
+ // Display-only continuity fix for the raw OHLCV view: the bot logs each
+ // candle's open as the actual first trade price in that window (the real
+ // on-chain tape), which legitimately jumps from the prior window's close on
+ // a thin/illiquid token. GMGN-style charts instead draw price as one
+ // continuous line chopped into candles (open[i] = close[i-1]). This only
+ // changes what's drawn here — it never touches the underlying ohlcv data,
+ // the recorded log, or the Heikin Ashi/KAMA/strategy pipeline, all of which
+ // still use the real first-trade open.
+ if(type==="ohlcv"){
+  for(let i=1;i<bars.length;i++){
+   bars[i].open=bars[i-1].close;
+   bars[i].high=Math.max(bars[i].high,bars[i].open);
+   bars[i].low=Math.min(bars[i].low,bars[i].open);
+  }
+ }
+ return bars;
+}
+
+function priceScaleFormat(candles){
+ let minAbs=Infinity;
+ candles.forEach(c=>{
+  [c.open,c.high,c.low,c.close].forEach(v=>{
+   const a=Math.abs(v);
+   if(a>0&&a<minAbs) minAbs=a;
+  });
+ });
+ const decimals=decimalsFor(minAbs===Infinity?1:minAbs);
+ return {type:"price",precision:decimals,minMove:Math.pow(10,-decimals)};
+}
+
+function init(){
+
+chart=LightweightCharts.createChart(chartEl,{
+ autoSize:true,
+ layout:{
+  background:{color:"transparent"},
+  textColor:"#aaa",
+  // Replaced by the #gmgnLink badge in the same corner (see updateGmgnLink) —
+  // one attribution mark there, not two overlapping.
+  attributionLogo:false
+ },
+ grid:{
+  vertLines:{color:"#20252d"},
+  horzLines:{color:"#20252d"}
+ },
+ localization:{
+  priceFormatter:activeFormatter
+ },
+ // Fixed so the right-hand label column never resizes when switching
+ // Price/MC — "0.0000003537" and "62.90K" are very different pixel widths,
+ // and letting the gutter auto-size to the longest visible label reflows the
+ // whole plot area (shifting/rescaling every candle) purely from a label
+ // change, which is exactly what toggling must not do.
+ rightPriceScale:{
+  minimumWidth:100
+ },
+ timeScale:{
+  timeVisible:true,
+  secondsVisible:false
+ },
+ crosshair:{
+  mode:LightweightCharts.CrosshairMode.Normal
+ }
+});
+
+series=chart.addSeries(LightweightCharts.CandlestickSeries,{
+ upColor:GREEN,
+ downColor:RED,
+ wickUpColor:GREEN,
+ wickDownColor:RED,
+ borderVisible:false
+});
+
+// autoSize:true above lets the chart manage its own canvas size on container
+// resize; this observer only needs to keep our overlay canvas's size and
+// bands in sync with it, not resize the chart itself.
+chart.timeScale().subscribeVisibleLogicalRangeChange(drawBackground);
+new ResizeObserver(()=>drawBackground()).observe(wrapEl);
+
+}
+
+// Full-height green/red bands behind the candles, one per bar, driven by
+// candles[].kama_hysteresis.color (and, within green, the per-run kamaTriggered STATE
+// — see its declaration above for why this isn't raw per-candle gate_pass). Uses
+// logical-index coordinates (not raw timestamps) so bands line up exactly with each
+// candle's on-screen slot even when slots have irregular real-time gaps between them.
+function drawBackground(){
+
+if(!chart||!barTimes.length) return;
+
+const dpr=window.devicePixelRatio||1;
+const w=wrapEl.clientWidth, h=wrapEl.clientHeight;
+if(bgCanvas.width!==Math.round(w*dpr)||bgCanvas.height!==Math.round(h*dpr)){
+ bgCanvas.width=Math.round(w*dpr);
+ bgCanvas.height=Math.round(h*dpr);
+}
+bgCanvas.style.width=w+"px";
+bgCanvas.style.height=h+"px";
+bgCtx.setTransform(dpr,0,0,dpr,0,0);
+bgCtx.clearRect(0,0,w,h);
+
+const ts=chart.timeScale();
+
+// logicalToCoordinate only returns a real value for integer logical indices —
+// a fractional index (e.g. i-0.5) silently resolves to 0 in this build. So the
+// per-bar half-width is derived from two integer coordinates instead of asking
+// the API directly for a bar's left/right edge.
+const c0=ts.logicalToCoordinate(0);
+const c1=ts.logicalToCoordinate(1);
+if(c0===null||c1===null) return;
+const halfBar=Math.abs(c1-c0)/2;
+
+for(let i=0;i<kamaColors.length;i++){
+ const center=ts.logicalToCoordinate(i);
+ if(center===null) continue;
+ // Extend half a pixel past each edge so adjacent bars' rects overlap instead
+ // of leaving a sub-pixel gap that shows through as a hairline seam.
+ const xLeft=center-halfBar-0.5, xRight=center+halfBar+0.5;
+ if(xRight<0||xLeft>w) continue;
+ bgCtx.fillStyle=kamaColors[i]==="green"
+  ?(kamaTriggered[i]?BG_GREEN_FULL:BG_GREEN_DIM)
+  :BG_RED;
+ bgCtx.fillRect(xLeft,0,Math.max(1,xRight-xLeft),h);
+}
+
+}
+
+function applyMarkers(markers){
+ if(typeof LightweightCharts.createSeriesMarkers==="function"){
+  if(markersApi) markersApi.setMarkers(markers);
+  else markersApi=LightweightCharts.createSeriesMarkers(series,markers);
+ } else if(series.setMarkers){
+  series.setMarkers(markers);
+ }
+}
+
+function render(data){
+
+if(!chart) init();
+
+lastData=data;
+mcFactor=findMcFactor(data.candles||[]);
+const candles=candlesFor(data,candleType);
+
+series.applyOptions({priceFormat:priceScaleFormat(candles)});
+series.setData(candles);
+
+barTimes=candles.map(c=>c.time);
+kamaColors=(data.candles||[]).map(c=>String(c.kama_hysteresis&&c.kama_hysteresis.color||"green").toLowerCase());
+kamaGatePass=(data.candles||[]).map(c=>{
+ const gp=c.gate&&c.gate.gate_pass;
+ return gp===undefined||gp===null?true:!!gp;
+});
+// Per-green-run trigger state, scanned once left to right: resets to false on every
+// red candle (so the next green run starts fresh), and on a green candle latches true
+// the first time gate_pass is true, staying true for the rest of that run regardless
+// of gate_pass afterward — see the kamaTriggered declaration above for why.
+{
+ let triggered=false;
+ kamaTriggered=kamaColors.map((color,i)=>{
+  if(color!=="green"){
+   triggered=false;
+   return false;
+  }
+  if(!triggered&&kamaGatePass[i]) triggered=true;
+  return triggered;
+ });
+}
+
+const markers=[];
+(data.trades||[]).forEach((t,idx)=>{
+ markers.push({
+  time:slotTime(t.entry_slot),
+  position:"belowBar",
+  shape:"arrowUp",
+  color:BLUE,
+  text:"BUY"
+ });
+ if(t.exit_slot){
+  const pnl=t.pnl_pct;
+  const hasPnl=pnl!==null&&pnl!==undefined;
+  markers.push({
+   time:slotTime(t.exit_slot),
+   position:"aboveBar",
+   shape:"arrowDown",
+   color:hasPnl&&pnl<0?RED:YELLOW,
+   text:hasPnl?`SELL ${pnl>=0?"+":""}${pnl.toFixed(1)}%`:"SELL"
+  });
+ }
+});
+// Downtrend start/clear markers, edge-triggered off candles[].downtrend.active
+// transitions (older logs recorded before this field existed just have no
+// transitions to find, since `active` defaults to false throughout). Distinct
+// shape+color from BUY/SELL so the two mechanisms are never visually confused —
+// this is a pause-new-entries signal, not a trade.
+let prevDowntrendActive=false;
+(data.candles||[]).forEach(c=>{
+ const active=!!(c.downtrend&&c.downtrend.active);
+ if(active&&!prevDowntrendActive){
+  markers.push({
+   time:slotTime(c.slot),
+   position:"aboveBar",
+   shape:"arrowDown",
+   color:ORANGE,
+   text:"📉 DOWNTREND"
+  });
+ } else if(!active&&prevDowntrendActive){
+  markers.push({
+   time:slotTime(c.slot),
+   position:"belowBar",
+   shape:"arrowUp",
+   color:CYAN,
+   text:"✅ CLEAR"
+  });
+ }
+ prevDowntrendActive=active;
+});
+
+markers.sort((a,b)=>a.time-b.time);
+applyMarkers(markers);
+
+if(!loaded){
+ // fitContent() zooms out to show the entire history at once, which lets a single
+ // outlier candle anywhere in a long history (a huge spike/dump) blow out the price
+ // scale for the whole chart, crushing all the "normal" candles into a sliver near one
+ // edge. GMGN-style charts default to a recent window instead — show the most recent
+ // INITIAL_VISIBLE_CANDLES bars (or everything, if there's less than that), so the
+ // initial view is actually readable; scrolling/zooming out from there still works.
+ const total=candles.length;
+ const windowSize=Math.min(total,INITIAL_VISIBLE_CANDLES);
+ if(windowSize>0){
+  chart.timeScale().setVisibleLogicalRange({from:total-windowSize,to:total});
+ }
+ loaded=true;
+}
+
+drawBackground();
+// logicalToCoordinate can still report a stale/zeroed layout on the very first
+// paint (before the browser's first real layout pass), so redraw once more on
+// the next frame to guarantee the KAMA bands line up on first load too.
+requestAnimationFrame(drawBackground);
+
+const s=data.summary||{};
+const lastColor=kamaColors.length?kamaColors[kamaColors.length-1]:null;
+const trendHtml=lastColor
+ ?`<span class="trend-${lastColor}">${lastColor==="green"?"▲ BULLISH":"▼ BEARISH"}</span>`
+ :"–";
+// Which OHLC series fed KAMA for the most recent candle ("RAW" or "HA" — see
+// candle.kama_input_source / KAMA_INPUT_SOURCE). Older logs recorded before this field
+// existed default to "RAW", matching the backend's own default.
+const lastCandleForSrc=(data.candles||[])[data.candles.length-1];
+const kamaSrc=lastCandleForSrc&&lastCandleForSrc.kama_input_source||"RAW";
+
+document.getElementById("cards").innerHTML=`
+<div class="card">Candles <b>${data.candles.length}</b></div>
+<div class="card">KAMA <b>${trendHtml}</b></div>
+<div class="card">KAMA src <b>${kamaSrc}</b></div>
+<div class="card">Trades <b>${s.total_trades||0}</b></div>
+<div class="card">Win <b>${s.win_rate_pct!==undefined?s.win_rate_pct.toFixed(1):0}%</b></div>
+<div class="card">PnL <b class="${(s.total_pnl_pct||0)>=0?"pnl-pos":"pnl-neg"}">${(s.total_pnl_pct||0).toFixed(2)}%</b></div>
+`;
+
+const rows=(data.trades||[]).slice(-25).reverse().map(t=>{
+ const open=!t.exit_slot;
+ const pnlCell=open
+  ?`<td class="open-row">open</td>`
+  :`<td class="${(t.pnl_pct||0)>=0?"pnl-pos":"pnl-neg"}">${t.pnl_pct!==undefined&&t.pnl_pct!==null?t.pnl_pct.toFixed(2)+"%":"-"}</td>`;
+ // size_sol/sizing_multiplier are absent on logs written before volatility-scaled
+ // sizing existed — fall back to "-" rather than a misleading 0.
+ const hasSize=t.size_sol!==undefined&&t.size_sol!==null;
+ const hasMultiplier=t.sizing_multiplier!==undefined&&t.sizing_multiplier!==null;
+ const multiplierSuffix=hasMultiplier&&t.sizing_multiplier!==1
+  ?` (${t.sizing_multiplier.toFixed(2)}x)`
+  :"";
+ const sizeCell=hasSize?`${t.size_sol.toFixed(3)}${multiplierSuffix}`:"-";
+ return `<tr class="${open?"open-row":""}">
+  <td>#${t.trade_id!==undefined?t.trade_id:""}</td>
+  <td>${fmt(t.entry_price)}</td>
+  <td>${open?"-":fmt(t.exit_price)}</td>
+  <td>${sizeCell}</td>
+  ${pnlCell}
+ </tr>`;
+}).join("");
+document.getElementById("tradeRows").innerHTML=rows||`<tr><td colspan="5">no trades yet</td></tr>`;
+
+}
+
+
+
+// index.json remains the source of truth for "currently live" — this only ADDS mints
+// that have a candle log on disk but aren't (or aren't yet) in that file, labeled
+// distinctly so they're never confused with something actively tracked. Relies on the
+// server's own auto-generated directory listing at "./" (Python's http.server default
+// when no index.html shadows it — see viewer.html's own filename): if that ever breaks
+// (a different static file server, a future index.html, a changed listing format), this
+// fails closed to today's index.json-only behavior rather than breaking the viewer.
+async function fetchArchivedMints(liveMints){
+try{
+let r=await fetch("./?"+Date.now());
+if(!r.ok) throw new Error(`directory listing HTTP ${r.status}`);
+let text=await r.text();
+let doc=new DOMParser().parseFromString(text,"text/html");
+let files=[...doc.querySelectorAll('a[href$=".json"]')]
+.map(a=>decodeURIComponent(a.getAttribute("href")))
+.filter(name=>name!=="index.json");
+return files
+.map(name=>name.slice(0,-".json".length))
+.filter(m=>!liveMints.has(m))
+.sort();
+}catch(e){
+console.warn("directory listing unavailable, showing only currently-live mints",e);
+return [];
+}
+}
+
+async function loadIndex(){
+
+let r=await fetch(INDEX_URL+"?"+Date.now());
+let j=await r.json();
+const liveMints=new Set(j.mints);
+const archivedMints=await fetchArchivedMints(liveMints);
+
+let sel=document.getElementById("mint");
+const previous=mint;
+sel.innerHTML="";
+
+const addOption=(m,live)=>{
+let o=document.createElement("option");
+o.value=m;
+o.textContent=(live?"🟢 LIVE ":"⚪ ARCHIVED ")+m;
+sel.appendChild(o);
+};
+j.mints.forEach(m=>addOption(m,true));
+archivedMints.forEach(m=>addOption(m,false));
+
+const allMints=[...j.mints,...archivedMints];
+mint=(previous&&allMints.includes(previous))?previous:allMints[0];
+sel.value=mint;
+updateGmgnLink();
+
+sel.onchange=()=>{
+mint=sel.value;
+updateGmgnLink();
+loaded=false;
+load();
+};
+
+}
+
+function updateGmgnLink(){
+document.getElementById("gmgnLink").href=
+mint?`https://gmgn.ai/sol/token/${mint}`:"#";
+}
+
+
+
+async function load(){
+
+try{
+
+if(!mint) return;
+
+let r=await fetch(`${DIR}/${mint}.json?t=${Date.now()}`);
+let d=await r.json();
+
+render(d);
+
+document.getElementById("status").textContent=
+"● LIVE "+new Date().toLocaleTimeString();
+
+}
+catch(e){
+
+document.getElementById("status").textContent=e.message;
+console.error(e);
+
+}
+
+}
+
+
+document.getElementById("candleType").onchange=(e)=>{
+candleType=e.target.value;
+if(lastData) render(lastData);
+};
+
+document.getElementById("priceMode").onchange=(e)=>{
+priceMode=e.target.value;
+// Deliberately not calling render() here: the plotted data/zoom/scroll must
+// stay exactly as-is (see activeFormatter/mcFactor above). Re-applying the
+// same activeFormatter reference only refreshes the last-price label, not
+// the axis ticks — passing a fresh wrapper closure forces the library to
+// see localization as genuinely changed and redraw every label, still
+// without touching the series or the view.
+if(chart) chart.applyOptions({localization:{priceFormatter:(x)=>activeFormatter(x)}});
+};
+
+loadIndex().then(load);
+setInterval(()=>{ loadIndex().then(load); },POLL);
+
+</script>
+
+</body>
+</html>

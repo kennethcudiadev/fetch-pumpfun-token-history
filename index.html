@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pump.fun Terminal</title>
+  <link rel="stylesheet" href="/viewer/style.css">
+  <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+</head>
+<body>
+
+<header class="topbar">
+  <input id="walletInput" type="text" placeholder="Target wallet address" spellcheck="false">
+  <input id="mintInput" type="text" placeholder="Mint address" spellcheck="false">
+  <select id="mintSelect" aria-label="Mints from wallet manifest">
+    <option value="">— mints from manifest —</option>
+  </select>
+  <span class="card" style="padding:7px 10px">1s</span>
+  <button id="loadBtn" type="button">Load</button>
+  <label class="top-check"><input id="tradersBar" type="checkbox"> traders</label>
+  <span id="status" class="status">enter wallet + mint, click Load</span>
+</header>
+
+<div id="tradingBar" hidden>
+<section class="track-bar">
+  <div class="track-bar-head">
+    <label for="trackedInput"><b>Tracked wallets</b> <span class="hint">one per line: wallet_address, emoji</span></label>
+    <button id="trackedApplyBtn" type="button">Apply</button>
+  </div>
+    <textarea id="trackedInput" rows="2" spellcheck="false" placeholder="Bi4rd5FH5bYEN8scZ7wevxNZyNmKHdaBcvewdPFxYdLt, 🐦"></textarea>
+</section>
+
+<section id="traderPanels" class="trader-panels">
+  <div class="empty-note">No tracked traders — edit config.json and run scripts/trader_dashboard_builder.py</div>
+</section>
+</div>
+
+<section class="summary-cards" id="summaryCards"></section>
+
+<section class="chart-section">
+  <div class="chart-toolbar">
+    <strong id="chartTitle">Select a mint</strong>
+    <label class="kama-ctrl">style
+      <select id="candleStyle" aria-label="Candle style">
+        <option value="candles" selected>candles</option>
+        <option value="heikin">HeikinAsh</option>
+      </select>
+    </label>
+    <label class="kama-ctrl"><input id="kamaVisible" type="checkbox" checked> KAMA</label>
+    <label class="kama-ctrl">bar
+      <select id="kamaBarMode" aria-label="KAMA bar mode">
+        <option value="slot" selected>1 slot</option>
+        <option value="second">1 second</option>
+      </select>
+    </label>
+    <label class="kama-ctrl"><input id="kamaHlPoints" type="checkbox" checked> H/L points</label>
+    <label class="kama-ctrl"><input id="kamaGlobalLines" type="checkbox" checked> global lines</label>
+    <label class="kama-ctrl"><input id="kamaBuySellMarks" type="checkbox" checked> buy/sell</label>
+    <label class="kama-ctrl">range N <input id="kamaRangeN" type="number" min="1" max="20" step="1" value="7" title="latest N peaks/bottoms for global high/low"></label>
+    <label class="kama-ctrl">src
+      <select id="kamaSrc" aria-label="KAMA candle source">
+        <option value="close" selected>close</option>
+        <option value="open">open</option>
+        <option value="average">average (OHLC)</option>
+      </select>
+    </label>
+    <label class="kama-ctrl">N <input id="kamaN" type="number" min="2" max="99" step="1" value="9"></label>
+    <label class="kama-ctrl">fast <input id="kamaFast" type="number" min="1" max="50" step="1" value="2" title="fast period → 2/(fast+1)"></label>
+    <label class="kama-ctrl">slow <input id="kamaSlow" type="number" min="2" max="200" step="1" value="30" title="slow period → 2/(slow+1)"></label>
+    <label class="kama-ctrl">swing % <input id="kamaSwing" type="number" min="0.1" max="50" step="0.1" value="1.0" title="min KAMA rise/drop to confirm a new peak or bottom"></label>
+    <span id="kamaStats" class="hint"></span>
+  </div>
+  <div class="chart-wrap">
+    <div id="chart"></div>
+    <div id="markerLayer" class="marker-layer"></div>
+    <a id="gmgnLink" class="gmgn-link" href="#" target="_blank" rel="noopener noreferrer">GMGN ↗</a>
+  </div>
+  <div class="legend">
+    <span><i class="swatch" style="background:#00d084"></i>Tracked BUY</span>
+    <span><i class="swatch" style="background:#ff4560"></i>Tracked SELL</span>
+    <span><i class="swatch" style="background:#60a5fa"></i>KAMA</span>
+    <span><i class="swatch" style="background:#7dd3fc"></i>L</span>
+    <span><i class="swatch" style="background:#fb923c"></i>H</span>
+    <span><i class="swatch" style="background:#fb7185"></i>LH</span>
+    <span><i class="swatch" style="background:#4ade80"></i>HL</span>
+    <span><i class="swatch" style="background:#f472b6"></i>x crash H</span>
+    <span><i class="swatch" style="background:#fb923c;height:2px;width:14px;border-radius:0"></i>global peak</span>
+    <span><i class="swatch" style="background:#7dd3fc;height:2px;width:14px;border-radius:0"></i>global bottom</span>
+    <span><i class="swatch" style="background:#facc15;height:2px;width:14px;border-radius:0"></i>25% from bottom</span>
+  </div>
+  <div id="hoverInfo" class="hover-info"></div>
+</section>
+
+<div class="table-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th>Time</th>
+        <th>Side</th>
+        <th>MC (USD)</th>
+        <th>SOL</th>
+        <th>Wallet</th>
+      </tr>
+    </thead>
+    <tbody id="tradeRows"></tbody>
+  </table>
+</div>
+
+<script src="/viewer/app.js"></script>
+</body>
+</html>
